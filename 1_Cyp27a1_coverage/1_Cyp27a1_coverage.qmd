@@ -1,0 +1,460 @@
+---
+title: "1_Cyp27a1_coverage: read coverage over Cyp27a1 exons in WT and KO"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+params:
+  gene: "Cyp27a1"
+---
+
+## Overview
+
+The *Cyp27a1* KO samples still show *Cyp27a1* reads at the gene level
+(`0_QC`). Here, per-base coverage from the nf-core/rnaseq bigwigs is plotted
+over the exons of the canonical transcript to locate the targeted region:
+a deleted exon should show a loss of coverage in all KO samples relative to
+the remaining exons.
+
+* The library is stranded: only the sense-strand bigwig is used
+  (`.forward` for genes on +, `.reverse` for genes on −; checked below).
+* Bigwigs contain raw coverage. Coverage is scaled to reads per million
+  using the TMM effective library sizes from `0_QC/outputs/files/dge.rds`.
+* Exons are taken from the frozen GENCODE vM25 GTF
+  (`data/gencode.vM25.primary_assembly.annotation.gtf.gz`, see
+  `0_QC/downloadAnnotation.R`).
+
+```{r setup}
+library(rtracklayer)
+library(GenomicRanges)
+library(edgeR)
+library(tidyverse)
+library(patchwork)
+library(yaml)
+library(here)
+
+source(here("functions", "formatting_ggplot.R"))
+config <- read_yaml(here("config.yaml"))
+genotype_colors <- unlist(config$genotype_colors)
+
+fig_dir <- here("1_Cyp27a1_coverage", "outputs", "figures")
+files_dir <- here("1_Cyp27a1_coverage", "outputs", "files")
+bw_dir <- here("data", "nfcore_rnaseq", "bigwig")
+
+save_fig <- function(p, name, width, height) {
+  ggsave(file.path(fig_dir, name), p, width = width, height = height)
+  p
+}
+```
+
+## Gene model
+
+The canonical transcript is the protein-coding CCDS transcript with the most
+exons. Exons are numbered 5' to 3'.
+
+```{r exons}
+gtf <- import(
+  here("data", "gencode.vM25.primary_assembly.annotation.gtf.gz"),
+  feature.type = c("gene", "transcript", "exon")
+)
+gene_gtf <- gtf[!is.na(gtf$gene_name) & gtf$gene_name == params$gene]
+rm(gtf)
+
+gene_gr <- gene_gtf[gene_gtf$type == "gene"]
+gene_strand <- as.character(strand(gene_gr))
+
+tx <- gene_gtf[gene_gtf$type == "transcript"]
+tx_df <- tibble(
+  transcript_id = tx$transcript_id,
+  transcript_type = tx$transcript_type,
+  ccds = map_lgl(tx$tag, \(x) "CCDS" %in% x),
+  n_exons = map_int(transcript_id, \(id) sum(gene_gtf$type == "exon" & gene_gtf$transcript_id %in% id)),
+  width = width(tx)
+)
+knitr::kable(tx_df)
+
+canonical_tx <- tx_df |>
+  filter(transcript_type == "protein_coding") |>
+  arrange(desc(ccds), desc(n_exons), desc(width)) |>
+  pull(transcript_id) |>
+  first()
+
+exons <- gene_gtf[gene_gtf$type == "exon" & gene_gtf$transcript_id %in% canonical_tx]
+exons <- sort(exons, decreasing = gene_strand == "-")
+exons$exon <- paste0("E", seq_along(exons))
+exons <- sort(exons)
+
+exon_df <- as.data.frame(exons) |>
+  dplyr::select(exon, seqnames, start, end, width, strand, exon_id) |>
+  mutate(exon = factor(exon, levels = paste0("E", seq_along(exons))))
+
+write.csv(exon_df, file.path(files_dir, "exons_canonical.csv"), row.names = FALSE)
+knitr::kable(exon_df)
+```
+
+## Load coverage
+
+```{r load-coverage}
+dge <- readRDS(here("0_QC", "outputs", "files", "dge.rds"))
+samples <- dge$samples |>
+  dplyr::select(sample_id, mouse, genotype, lib.size, norm.factors) |>
+  mutate(
+    genotype = factor(genotype, levels = c("WT", "KO")),
+    scale = 1e6 / (lib.size * norm.factors)
+  )
+
+locus <- range(gene_gr)
+
+read_cov <- function(sample_id, strand_suffix) {
+  import(
+    file.path(bw_dir, paste0(sample_id, strand_suffix, ".bigWig")),
+    which = locus,
+    as = "NumericList"
+  )[[1]]
+}
+
+# per-base raw coverage over the gene locus, sense and antisense strand
+sense_suffix <- if (gene_strand == "+") ".forward" else ".reverse"
+antisense_suffix <- if (gene_strand == "+") ".reverse" else ".forward"
+
+cov_sense <- map(set_names(samples$sample_id), \(s) read_cov(s, sense_suffix))
+cov_antisense <- map(set_names(samples$sample_id), \(s) read_cov(s, antisense_suffix))
+```
+
+### Strand check
+
+In a stranded library, almost all reads over an exon should come from the
+sense-strand bigwig.
+
+```{r strand-check}
+in_exon <- (start(locus):end(locus)) %in% unlist(as(ranges(exons), "IntegerList"))
+
+tibble(
+  sample_id = samples$sample_id,
+  sense = map_dbl(cov_sense, \(x) sum(x[in_exon])),
+  antisense = map_dbl(cov_antisense, \(x) sum(x[in_exon]))
+) |>
+  mutate(pct_sense = 100 * sense / (sense + antisense)) |>
+  knitr::kable(digits = 1)
+```
+
+```{r coverage-df}
+cov_df <- imap(cov_sense, \(x, s) {
+  tibble(sample_id = s, pos = start(locus):end(locus), raw = as.numeric(x))
+}) |>
+  list_rbind() |>
+  left_join(samples, by = "sample_id") |>
+  mutate(cov = raw * scale)
+
+# exon membership of each position
+exon_hits <- findOverlaps(
+  GRanges(seqnames(locus), IRanges(start(locus):end(locus), width = 1)),
+  exons
+)
+pos_exon <- rep(NA_character_, width(locus))
+pos_exon[queryHits(exon_hits)] <- exons$exon[subjectHits(exon_hits)]
+
+cov_df <- cov_df |>
+  mutate(exon = pos_exon[pos - start(locus) + 1])
+```
+
+## Coverage over the locus
+
+Coverage scaled to reads per million (TMM). Shaded areas are exons of the
+canonical transcript; the line is the genotype mean and the ribbon the range
+across mice.
+
+```{r locus-helpers}
+exon_rect <- exon_df |>
+  mutate(mid = (start + end) / 2)
+
+gene_model <- function(xvar_start, xvar_end, xmid) {
+  ggplot(exon_rect) +
+    geom_hline(yintercept = 0, linewidth = .3) +
+    geom_rect(
+      aes(xmin = {{ xvar_start }}, xmax = {{ xvar_end }}, ymin = -1, ymax = 1),
+      fill = "black"
+    ) +
+    geom_text(aes(x = {{ xmid }}, y = -2.3, label = exon), size = 3.5) +
+    scale_y_continuous(limits = c(-3, 1.2)) +
+    theme_void()
+}
+
+exon_shading <- function(xvar_start, xvar_end) {
+  geom_rect(
+    data = exon_rect,
+    aes(xmin = {{ xvar_start }}, xmax = {{ xvar_end }}, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = "grey90"
+  )
+}
+
+summarise_genotype <- function(df, x) {
+  df |>
+    group_by(genotype, {{ x }}) |>
+    summarise(mean = mean(cov), min = min(cov), max = max(cov), .groups = "drop")
+}
+```
+
+```{r locus-genotype, fig.width = 11, fig.height = 5}
+locus_genotype <- summarise_genotype(cov_df, pos)
+
+p_locus <- ggplot(locus_genotype, aes(x = pos)) +
+  exon_shading(start, end) +
+  geom_ribbon(aes(ymin = min, ymax = max, fill = genotype), alpha = .3) +
+  geom_line(aes(y = mean, color = genotype), linewidth = .4) +
+  scale_fill_manual(values = genotype_colors) +
+  scale_color_manual(values = genotype_colors) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  my_theme +
+  theme(plot.title = element_text(face = "italic")) +
+  labs(
+    x = paste0(seqnames(locus), " (", gene_strand, " strand)"),
+    y = "Coverage (per million reads)",
+    color = "Genotype",
+    fill = "Genotype",
+    title = params$gene
+  )
+
+p_locus_model <- p_locus / (gene_model(start, end, mid) + coord_cartesian(xlim = range(cov_df$pos))) +
+  plot_layout(heights = c(5, 1))
+
+save_fig(p_locus_model, "coverage_locus_genotype.pdf", 11, 5)
+```
+
+```{r locus-sample, fig.width = 11, fig.height = 9}
+p_locus_sample <- ggplot(cov_df, aes(x = pos, y = cov)) +
+  exon_shading(start, end) +
+  geom_area(aes(fill = genotype)) +
+  facet_wrap(~ genotype + mouse, ncol = 1, strip.position = "right") +
+  scale_fill_manual(values = genotype_colors) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  my_theme +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 12, angle = 0),
+    legend.position = "none"
+  ) +
+  labs(
+    x = paste0(seqnames(locus), " (", gene_strand, " strand)"),
+    y = "Coverage (per million reads)"
+  )
+
+save_fig(p_locus_sample, "coverage_locus_sample.pdf", 11, 9)
+```
+
+## Coverage over exons only
+
+Introns removed and exons concatenated (5' to 3' left to right on the
+genome), so each exon is visible regardless of intron length.
+
+```{r exon-coords}
+gap <- 30
+exon_rect <- exon_rect |>
+  arrange(start) |>
+  mutate(
+    x_start = cumsum(lag(width + gap, default = 0)),
+    x_end = x_start + width,
+    x_mid = (x_start + x_end) / 2
+  )
+
+cov_exon_df <- cov_df |>
+  filter(!is.na(exon)) |>
+  left_join(exon_rect |> dplyr::select(exon, start, x_start), by = "exon") |>
+  mutate(x = x_start + pos - start)
+```
+
+```{r exon-genotype, fig.width = 11, fig.height = 5}
+exon_genotype <- cov_exon_df |>
+  group_by(genotype, exon, x) |>
+  summarise(mean = mean(cov), min = min(cov), max = max(cov), .groups = "drop")
+
+p_exon <- ggplot(exon_genotype, aes(x = x, group = interaction(genotype, exon))) +
+  exon_shading(x_start, x_end) +
+  geom_ribbon(aes(ymin = min, ymax = max, fill = genotype), alpha = .3) +
+  geom_line(aes(y = mean, color = genotype), linewidth = .4) +
+  scale_fill_manual(values = genotype_colors) +
+  scale_color_manual(values = genotype_colors) +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(face = "italic")
+  ) +
+  labs(
+    x = "",
+    y = "Coverage (per million reads)",
+    color = "Genotype",
+    fill = "Genotype",
+    title = paste0(params$gene, " exons (", canonical_tx, ")")
+  )
+
+p_exon_model <- p_exon / (gene_model(x_start, x_end, x_mid) + coord_cartesian(xlim = range(cov_exon_df$x))) +
+  plot_layout(heights = c(5, 1))
+
+save_fig(p_exon_model, "coverage_exons_genotype.pdf", 11, 5)
+```
+
+```{r exon-sample, fig.width = 11, fig.height = 9}
+p_exon_sample <- ggplot(cov_exon_df, aes(x = x, y = cov, group = exon)) +
+  exon_shading(x_start, x_end) +
+  geom_area(aes(fill = genotype)) +
+  geom_text(
+    data = exon_rect,
+    aes(x = x_mid, y = Inf, label = exon),
+    inherit.aes = FALSE,
+    vjust = 1.3,
+    size = 3
+  ) +
+  facet_wrap(~ genotype + mouse, ncol = 1, strip.position = "right") +
+  scale_fill_manual(values = genotype_colors) +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 12, angle = 0),
+    legend.position = "none"
+  ) +
+  labs(x = "", y = "Coverage (per million reads)")
+
+save_fig(p_exon_sample, "coverage_exons_sample.pdf", 11, 9)
+```
+
+## Zoom: exon 8
+
+Coverage over exon 8 with `r 20` bp of flanking intron. The dashed line marks
+the position with the largest increase in mean KO coverage between adjacent
+bases (the step where KO coverage resumes).
+
+```{r e8-zoom-data}
+flank <- 20
+e8 <- exon_df |> filter(exon == "E8")
+
+cov_e8 <- cov_df |>
+  filter(pos >= e8$start - flank, pos <= e8$end + flank)
+
+e8_genotype <- summarise_genotype(cov_e8, pos)
+
+ko_mean <- e8_genotype |> filter(genotype == "KO") |> arrange(pos)
+ko_step <- ko_mean$pos[which.max(diff(ko_mean$mean)) + 1]
+
+tibble(
+  step_position = paste0(seqnames(locus), ":", ko_step),
+  bp_into_E8 = ko_step - e8$start + 1,
+  E8_width = e8$width
+) |>
+  knitr::kable()
+
+e8_layers <- list(
+  annotate("rect", xmin = e8$start, xmax = e8$end, ymin = -Inf, ymax = Inf, fill = "grey90"),
+  geom_vline(xintercept = ko_step, linetype = "dashed", linewidth = .4),
+  scale_x_continuous(labels = scales::label_comma(), expand = c(0, 0)),
+  my_theme
+)
+```
+
+```{r e8-zoom-genotype, fig.width = 8, fig.height = 4}
+p_e8 <- ggplot(e8_genotype, aes(x = pos)) +
+  e8_layers +
+  geom_ribbon(aes(ymin = min, ymax = max, fill = genotype), alpha = .3) +
+  geom_line(aes(y = mean, color = genotype), linewidth = .5) +
+  scale_fill_manual(values = genotype_colors) +
+  scale_color_manual(values = genotype_colors) +
+  theme(plot.title = element_text(face = "italic")) +
+  labs(
+    x = paste0(seqnames(locus), " (", gene_strand, " strand)"),
+    y = "Coverage (per million reads)",
+    color = "Genotype",
+    fill = "Genotype",
+    title = paste0(params$gene, " exon 8")
+  )
+
+save_fig(p_e8, "coverage_e8_zoom_genotype.pdf", 8, 4)
+```
+
+```{r e8-zoom-sample, fig.width = 8, fig.height = 9}
+p_e8_sample <- ggplot(cov_e8, aes(x = pos, y = cov)) +
+  e8_layers +
+  geom_area(aes(fill = genotype)) +
+  facet_wrap(~ genotype + mouse, ncol = 1, strip.position = "right") +
+  scale_fill_manual(values = genotype_colors) +
+  theme(
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 12, angle = 0),
+    legend.position = "none"
+  ) +
+  labs(
+    x = paste0(seqnames(locus), " (", gene_strand, " strand)"),
+    y = "Coverage (per million reads)"
+  )
+
+save_fig(p_e8_sample, "coverage_e8_zoom_sample.pdf", 8, 9)
+```
+
+## Per-exon summary
+
+Mean coverage per exon. To separate a local loss (deleted exon) from an
+overall reduction of the transcript (e.g. nonsense-mediated decay), coverage
+is also shown relative to each sample's mean over all exons.
+
+```{r exon-summary, fig.width = 11, fig.height = 4.5}
+exon_summary <- cov_exon_df |>
+  group_by(sample_id, mouse, genotype, exon) |>
+  summarise(mean_cov = mean(cov), .groups = "drop") |>
+  group_by(sample_id) |>
+  mutate(rel_cov = mean_cov / mean(mean_cov)) |>
+  ungroup() |>
+  mutate(exon = factor(exon, levels = levels(exon_df$exon)))
+
+write.csv(exon_summary, file.path(files_dir, "exon_coverage_per_sample.csv"), row.names = FALSE)
+
+exon_points <- function(y, ylab) {
+  ggplot(exon_summary, aes(x = exon, y = {{ y }}, fill = genotype)) +
+    geom_boxplot(outlier.alpha = 0, alpha = .5, position = position_dodge(.8), width = .7) +
+    geom_point(shape = 21, size = 2, position = position_jitterdodge(jitter.width = .15, dodge.width = .8)) +
+    scale_fill_manual(values = genotype_colors) +
+    my_theme +
+    labs(x = "", y = ylab, fill = "Genotype")
+}
+
+p_exon_summary <- (
+  exon_points(mean_cov, "Mean coverage\n(per million reads)") |
+    exon_points(rel_cov, "Coverage relative to\nsample mean over exons")
+) +
+  plot_layout(guides = "collect")
+
+save_fig(p_exon_summary, "exon_coverage_summary.pdf", 11, 4.5)
+```
+
+```{r exon-ratio, fig.width = 6, fig.height = 4}
+exon_ratio <- exon_summary |>
+  group_by(exon, genotype) |>
+  summarise(mean_cov = mean(mean_cov), .groups = "drop") |>
+  pivot_wider(names_from = genotype, values_from = mean_cov) |>
+  mutate(log2_KO_WT = log2((KO + 1e-3) / (WT + 1e-3)))
+
+write.csv(exon_ratio, file.path(files_dir, "exon_coverage_KO_vs_WT.csv"), row.names = FALSE)
+
+p_ratio <- ggplot(exon_ratio, aes(x = exon, y = log2_KO_WT)) +
+  geom_col(fill = genotype_colors["KO"]) +
+  geom_hline(yintercept = 0) +
+  my_theme +
+  labs(x = "", y = "log2(KO / WT)\nmean exon coverage")
+
+save_fig(p_ratio, "exon_coverage_ratio.pdf", 6, 4)
+
+knitr::kable(exon_ratio, digits = 3)
+```
+
+## Save outputs
+
+```{r save}
+writeLines(capture.output(sessionInfo()), here("1_Cyp27a1_coverage", "sessionInfo.txt"))
+```

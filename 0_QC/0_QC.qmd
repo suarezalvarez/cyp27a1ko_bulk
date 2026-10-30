@@ -1,0 +1,508 @@
+---
+title: "0_QC: Cyp27a1 KO vs WT – sorted mouse colon epithelium"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+Quality control of bulk RNA-seq from FACS-sorted colon epithelial cells
+(3 WT, 3 *Cyp27a1* KO). Counts were generated with nf-core/rnaseq (salmon)
+against GENCODE vM25 (GRCm38). The strategy follows `KKIK_bulk/0_QC`
+(protein-coding filtering, removal of mitochondrial genes, `filterByExpr`,
+TMM + logCPM, `SummarizedExperiment`/`DGEList` outputs), with checks specific
+to sorted mouse epithelium:
+
+1. Library size, detected genes, biotype composition and mitochondrial fraction.
+2. Sort purity: epithelial markers vs immune/stromal/endothelial/muscle/RBC contamination.
+3. Regional identity (colon vs small intestine) and epithelial cell type composition.
+4. Dissociation/sorting stress signature (immediate early genes).
+5. Sex check (*Xist* vs Y-linked genes) and genotype check (*Cyp27a1*).
+6. Gene filtering, normalisation and sample-level similarity (MDS, correlation).
+
+The gene annotation is frozen in `0_QC/outputs/files/annot.csv`
+(built from the GTF by `0_QC/downloadAnnotation.R`).
+
+```{r setup}
+library(edgeR)
+library(SummarizedExperiment)
+library(tidyverse)
+library(patchwork)
+library(geneplotter)
+library(ggrepel)
+library(yaml)
+library(here)
+
+source(here("functions", "formatting_ggplot.R"))
+config <- read_yaml(here("config.yaml"))
+genotype_colors <- unlist(config$genotype_colors)
+
+fig_dir <- here("0_QC", "outputs", "figures")
+files_dir <- here("0_QC", "outputs", "files")
+
+save_fig <- function(p, name, width, height) {
+  ggsave(file.path(fig_dir, name), p, width = width, height = height)
+  p
+}
+```
+
+## Load data
+
+```{r load}
+counts_raw <- read.delim(
+  here("data", "nfcore_rnaseq", "counts", "salmon.merged.gene_counts.tsv"),
+  check.names = FALSE
+)
+annot <- read.csv(here("0_QC", "outputs", "files", "annot.csv"))
+metadata <- read.csv(here("metadata", "metadata.csv")) |>
+  mutate(genotype = factor(genotype, levels = c("WT", "KO")))
+
+# salmon estimated counts are non-integer: round for edgeR
+counts <- counts_raw |>
+  column_to_rownames("gene_id") |>
+  dplyr::select(all_of(metadata$sample_id)) |>
+  as.matrix() |>
+  round()
+
+# all gene ids must be present in the frozen annotation
+stopifnot(all(rownames(counts) %in% annot$gene_id))
+annot <- annot[match(rownames(counts), annot$gene_id), ]
+rownames(annot) <- annot$gene_id
+
+dim(counts)
+```
+
+## Sample-level QC on all genes
+
+```{r sample-metrics}
+lib_size <- colSums(counts)
+
+biotype_group <- case_when(
+  annot$chromosome_name == "chrM" ~ "mitochondrial",
+  annot$gene_biotype == "protein_coding" ~ "protein_coding",
+  annot$gene_biotype == "lncRNA" ~ "lncRNA",
+  grepl("rRNA", annot$gene_biotype) ~ "rRNA",
+  grepl("pseudogene", annot$gene_biotype) ~ "pseudogene",
+  TRUE ~ "other"
+)
+
+qc_metrics <- metadata |>
+  mutate(
+    lib_size = lib_size[sample_id],
+    detected_genes = colSums(counts > 0)[sample_id],
+    detected_pc_genes = colSums(
+      counts[biotype_group == "protein_coding", ] >= 10
+    )[sample_id],
+    pct_mito = 100 *
+      colSums(counts[biotype_group == "mitochondrial", ])[sample_id] /
+      lib_size,
+    pct_rRNA = 100 *
+      colSums(counts[biotype_group == "rRNA", ])[sample_id] / lib_size,
+    pct_protein_coding = 100 *
+      colSums(counts[biotype_group == "protein_coding", ])[sample_id] /
+      lib_size
+  )
+
+qc_metrics |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  knitr::kable()
+```
+
+### Library size
+
+```{r libsize, fig.width = 10, fig.height = 4}
+bar_metric <- function(df, y, ylab) {
+  df |>
+    mutate(sample_id = factor(sample_id, levels = sample_id[order(.data[[y]])])) |>
+    ggplot(aes(x = sample_id, y = .data[[y]], fill = genotype)) +
+    geom_col() +
+    scale_fill_manual(values = genotype_colors) +
+    my_theme +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+    labs(x = "", y = ylab, fill = "Genotype")
+}
+
+p_lib <- (
+  bar_metric(mutate(qc_metrics, lib_size = lib_size / 1e6), "lib_size", "Million of reads") |
+    bar_metric(qc_metrics, "detected_pc_genes", "Protein-coding genes\n(>= 10 counts)")
+) +
+  plot_layout(guides = "collect")
+
+save_fig(p_lib, "libsize_barplot.pdf", 10, 4)
+```
+
+### Biotype composition and mitochondrial fraction
+
+A high mitochondrial fraction in sorted epithelium points to stressed or
+dying cells (or cytoplasmic RNA loss) during dissociation and sorting.
+rRNA should be low after poly(A) selection.
+
+```{r biotypes, fig.width = 10, fig.height = 4}
+biotype_df <- rowsum(counts, biotype_group) |>
+  as.data.frame() |>
+  rownames_to_column("biotype") |>
+  pivot_longer(-biotype, names_to = "sample_id", values_to = "counts") |>
+  group_by(sample_id) |>
+  mutate(pct = 100 * counts / sum(counts)) |>
+  ungroup() |>
+  left_join(metadata, by = "sample_id")
+
+p_biotype <- ggplot(biotype_df, aes(x = sample_id, y = pct, fill = biotype)) +
+  geom_col() +
+  scale_fill_manual(values = get_color_list(6)) +
+  my_theme +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  labs(x = "", y = "% of counts", fill = "")
+
+p_mito <- bar_metric(qc_metrics, "pct_mito", "% mitochondrial counts")
+
+save_fig(p_biotype | p_mito, "biotypes_mito.pdf", 10, 4)
+```
+
+### Most abundant genes
+
+A few genes dominating the library reduce the effective depth. In colon
+epithelium, *Car1*, *Muc2*, *Fcgbp* and mitochondrial transcripts are
+expected to be among the top.
+
+```{r top-genes, fig.width = 6, fig.height = 6}
+top_genes <- names(sort(rowMeans(cpm(counts)), decreasing = TRUE))[1:20]
+
+top_df <- (100 * t(t(counts[top_genes, ]) / lib_size)) |>
+  as.data.frame() |>
+  rownames_to_column("gene_id") |>
+  mutate(gene = annot[gene_id, "external_gene_name"]) |>
+  pivot_longer(-c(gene_id, gene), names_to = "sample_id", values_to = "pct") |>
+  left_join(metadata, by = "sample_id") |>
+  mutate(gene = factor(gene, levels = rev(unique(annot[top_genes, "external_gene_name"]))))
+
+p_top <- ggplot(top_df, aes(x = pct, y = gene, color = genotype)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = genotype_colors) +
+  my_theme +
+  theme(axis.text.y = element_text(face = "italic")) +
+  labs(x = "% of library", y = "", color = "Genotype")
+
+save_fig(p_top, "top20_genes.pdf", 6, 6)
+```
+
+## Sorted epithelium-specific checks
+
+```{r logcpm-all}
+# logCPM on gene symbols for marker inspection (all genes, before filtering)
+symbol_counts <- rowsum(counts, annot$external_gene_name)
+logcpm_all <- cpm(symbol_counts, log = TRUE)
+
+marker_heatmap <- function(markers, value_name = "logCPM") {
+  markers <- markers |> filter(gene %in% rownames(logcpm_all))
+  logcpm_all[markers$gene, , drop = FALSE] |>
+    as.data.frame() |>
+    rownames_to_column("gene") |>
+    pivot_longer(-gene, names_to = "sample_id", values_to = "logCPM") |>
+    left_join(markers, by = "gene") |>
+    left_join(metadata, by = "sample_id") |>
+    mutate(
+      gene = factor(gene, levels = rev(markers$gene)),
+      group = factor(group, levels = unique(markers$group))
+    ) |>
+    ggplot(aes(x = sample_id, y = gene, fill = logCPM)) +
+    geom_tile() +
+    geom_text(aes(label = round(logCPM, 1)), size = 3) +
+    facet_grid(group ~ genotype, scales = "free", space = "free") +
+    scale_fill_distiller(palette = "RdYlBu", direction = -1) +
+    hmtheme +
+    theme(strip.text.y = element_text(angle = 0, hjust = 0)) +
+    labs(fill = value_name)
+}
+```
+
+### Sort purity
+
+Sorted epithelial cells should express high *Epcam*/*Cdh1*/*Vil1* and show
+little to no signal for haematopoietic (*Ptprc*), stromal, endothelial,
+smooth muscle, glial or red blood cell genes. Contamination markers at
+logCPM > ~3 in a subset of samples would point to sorting impurity and could
+confound KO vs WT differences.
+
+```{r purity, fig.width = 8, fig.height = 9}
+purity_markers <- tribble(
+  ~gene, ~group,
+  "Epcam", "epithelial",
+  "Cdh1", "epithelial",
+  "Vil1", "epithelial",
+  "Krt8", "epithelial",
+  "Krt20", "epithelial",
+  "Cdx2", "epithelial",
+  "Ptprc", "immune",
+  "Cd3e", "immune",
+  "Cd19", "immune",
+  "Lyz2", "immune",
+  "Adgre1", "immune",
+  "Itgax", "immune",
+  "Col1a1", "stromal",
+  "Col3a1", "stromal",
+  "Pdgfra", "stromal",
+  "Vim", "stromal",
+  "Pecam1", "endothelial",
+  "Cdh5", "endothelial",
+  "Acta2", "smooth muscle",
+  "Des", "smooth muscle",
+  "Myh11", "smooth muscle",
+  "Plp1", "glial",
+  "Sox10", "glial",
+  "Hba-a1", "RBC",
+  "Hbb-bs", "RBC"
+)
+
+save_fig(marker_heatmap(purity_markers), "purity_markers.pdf", 8, 9)
+```
+
+### Regional identity and epithelial composition
+
+Colon identity (*Car1*, *Satb2*, *Slc26a3*, *Aqp8*) should dominate over
+small-intestinal genes (*Fabp6*, *Lct*, *Apoa4*, *Fabp2*). Comparable levels
+of lineage markers (stem, proliferation, goblet, enteroendocrine, tuft,
+colonocyte) across samples indicate a similar composition of the sorted
+epithelium; a shift could reflect the genotype or a different sampled
+segment (proximal vs distal colon: *Car1*/*Hoxb13* gradients).
+
+```{r composition, fig.width = 8, fig.height = 10}
+composition_markers <- tribble(
+  ~gene, ~group,
+  "Car1", "colon",
+  "Satb2", "colon",
+  "Slc26a3", "colon",
+  "Aqp8", "colon",
+  "Hoxb13", "colon",
+  "Fabp6", "small intestine",
+  "Lct", "small intestine",
+  "Apoa4", "small intestine",
+  "Fabp2", "small intestine",
+  "Lgr5", "stem",
+  "Olfm4", "stem",
+  "Mki67", "proliferation",
+  "Top2a", "proliferation",
+  "Muc2", "goblet",
+  "Clca1", "goblet",
+  "Tff3", "goblet",
+  "Chga", "enteroendocrine",
+  "Dclk1", "tuft",
+  "Car4", "colonocyte",
+  "Slc26a2", "colonocyte",
+  "Ceacam1", "colonocyte"
+)
+
+save_fig(marker_heatmap(composition_markers), "composition_markers.pdf", 8, 10)
+```
+
+### Dissociation / sorting stress
+
+Enzymatic dissociation and FACS induce immediate early and heat-shock genes
+(van den Brink et al., 2017). Strong differences between samples here are
+technical and should be considered in downstream models if unbalanced
+between genotypes.
+
+```{r stress, fig.width = 8, fig.height = 5}
+stress_markers <- tibble(
+  gene = c("Fos", "Fosb", "Jun", "Junb", "Egr1", "Atf3", "Ier2", "Hspa1a", "Hspa1b", "Dusp1"),
+  group = "stress"
+)
+
+save_fig(marker_heatmap(stress_markers), "stress_markers.pdf", 8, 5)
+```
+
+### Sex check
+
+```{r sex, fig.width = 8, fig.height = 3.5}
+sex_markers <- tribble(
+  ~gene, ~group,
+  "Xist", "female",
+  "Ddx3y", "male",
+  "Eif2s3y", "male",
+  "Kdm5d", "male",
+  "Uty", "male"
+)
+
+save_fig(marker_heatmap(sex_markers), "sex_markers.pdf", 8, 3.5)
+
+qc_metrics <- qc_metrics |>
+  mutate(
+    inferred_sex = if_else(
+      logcpm_all["Xist", sample_id] > colMeans(logcpm_all[c("Ddx3y", "Eif2s3y", "Kdm5d", "Uty"), sample_id]),
+      "female",
+      "male"
+    )
+  )
+table(qc_metrics$inferred_sex, qc_metrics$genotype)
+```
+
+### Genotype check: *Cyp27a1*
+
+Expression of *Cyp27a1* per sample. Depending on the KO allele design
+(exon deletion, frameshift, conditional deletion in epithelium), transcript
+may still be detected in KO samples; a definitive check requires coverage
+over the targeted exon(s) (bigwig/BAM).
+
+```{r genotype, fig.width = 4, fig.height = 4}
+cyp_df <- tibble(
+  sample_id = colnames(logcpm_all),
+  logCPM = logcpm_all["Cyp27a1", ],
+  counts = symbol_counts["Cyp27a1", ]
+) |>
+  left_join(metadata, by = "sample_id")
+
+p_cyp <- ggplot(cyp_df, aes(x = genotype, y = logCPM, fill = genotype)) +
+  geom_boxplot(outlier.alpha = 0, alpha = .5) +
+  geom_point(shape = 21, size = 3) +
+  geom_text_repel(aes(label = mouse), size = 4) +
+  scale_fill_manual(values = genotype_colors) +
+  my_theme +
+  theme(legend.position = "none", plot.title = element_text(face = "italic")) +
+  labs(x = "", y = "log(CPM)", title = "Cyp27a1")
+
+save_fig(p_cyp, "cyp27a1_expression.pdf", 4, 4)
+
+cyp_df |> dplyr::select(sample_id, genotype, counts, logCPM) |> knitr::kable(digits = 2)
+```
+
+## Gene filtering and normalisation
+
+Same steps as `KKIK_bulk/0_QC`: keep protein-coding genes, remove
+mitochondrially-encoded genes, collapse to gene symbols, filter lowly
+expressed genes with `filterByExpr` (grouped by genotype), TMM-normalise
+and compute logCPM. The KKIK-specific second filter (> 25 counts in > 30
+samples) was designed for a cohort of > 100 samples and is not applied
+here; with n = 3 per group, `filterByExpr` requires a minimum count in at
+least 3 samples.
+
+```{r filter}
+# protein-coding, nuclear genes
+keep_pc <- annot$gene_biotype == "protein_coding" & annot$chromosome_name != "chrM"
+counts_pc <- counts[keep_pc, ]
+
+# collapse duplicated symbols
+genes_counts <- rowsum(counts_pc, annot[keep_pc, "external_gene_name"])
+genes_counts <- genes_counts[order(rownames(genes_counts)), ]
+
+# rowData: one row per symbol (first gene id when symbols are duplicated)
+gene_data <- annot[keep_pc, ]
+gene_data <- gene_data[match(rownames(genes_counts), gene_data$external_gene_name), ]
+rownames(gene_data) <- gene_data$external_gene_name
+
+se <- SummarizedExperiment(
+  assays = list(counts = genes_counts),
+  colData = metadata |> left_join(qc_metrics |> dplyr::select(sample_id, inferred_sex), by = "sample_id"),
+  rowData = gene_data
+)
+colnames(se) <- se$sample_id
+
+dge <- DGEList(
+  counts = assays(se)$counts,
+  genes = as.data.frame(rowData(se)),
+  samples = as.data.frame(colData(se)),
+  group = se$genotype
+)
+
+mask <- filterByExpr(dge, group = dge$samples$genotype)
+dge.filt <- dge[mask, , keep.lib.sizes = FALSE]
+se.filt <- se[mask, ]
+dge.filt <- calcNormFactors(dge.filt)
+assays(se.filt)$logCPM <- cpm(dge.filt, log = TRUE)
+se.filt$norm.factors <- dge.filt$samples$norm.factors
+
+tibble(
+  step = c("all genes", "protein-coding nuclear", "collapsed symbols", "filterByExpr"),
+  n_genes = c(nrow(counts), nrow(counts_pc), nrow(genes_counts), sum(mask))
+) |>
+  knitr::kable()
+
+dge.filt$samples |>
+  dplyr::select(sample_id, genotype, lib.size, norm.factors) |>
+  knitr::kable(digits = 3)
+```
+
+### Distribution of logCPM
+
+```{r density, fig.width = 7, fig.height = 3.5}
+plot_density <- function() {
+  par(mfrow = c(1, 2))
+  multidensity(
+    as.list(as.data.frame(cpm(dge, log = TRUE))),
+    xlab = "log2 CPM",
+    legend = NULL,
+    main = "unfiltered",
+    las = 1
+  )
+  multidensity(
+    as.list(as.data.frame(assays(se.filt)$logCPM)),
+    xlab = "log2 CPM",
+    legend = NULL,
+    main = "filtered + TMM",
+    las = 1
+  )
+}
+
+pdf(file.path(fig_dir, "multidensity.pdf"), width = 7, height = 3.5)
+plot_density()
+invisible(dev.off())
+plot_density()
+```
+
+### Sample similarity
+
+Samples should not separate by technical metrics; outliers in MDS or the
+correlation matrix are cross-checked against the metrics above.
+
+```{r similarity, fig.width = 10, fig.height = 4.5}
+mds <- plotMDS(dge.filt, plot = FALSE)
+mds_df <- tibble(
+  sample_id = colnames(dge.filt),
+  dim1 = mds$x,
+  dim2 = mds$y
+) |>
+  left_join(qc_metrics, by = "sample_id")
+
+p_mds <- ggplot(mds_df, aes(x = dim1, y = dim2, fill = genotype)) +
+  geom_point(shape = 21, size = 4) +
+  geom_text_repel(aes(label = mouse), size = 4) +
+  scale_fill_manual(values = genotype_colors) +
+  my_theme +
+  labs(
+    x = paste0("Leading logFC dim 1 (", round(100 * mds$var.explained[1]), "%)"),
+    y = paste0("Leading logFC dim 2 (", round(100 * mds$var.explained[2]), "%)"),
+    fill = "Genotype"
+  )
+
+cor_df <- cor(assays(se.filt)$logCPM, method = "pearson") |>
+  as.data.frame() |>
+  rownames_to_column("sample_1") |>
+  pivot_longer(-sample_1, names_to = "sample_2", values_to = "r")
+
+p_cor <- ggplot(cor_df, aes(x = sample_1, y = sample_2, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = round(r, 3)), size = 3) +
+  scale_fill_distiller(palette = "RdYlBu", direction = -1) +
+  hmtheme +
+  theme(axis.text.y = element_text(face = "plain")) +
+  labs(fill = "Pearson r")
+
+save_fig(p_mds | p_cor, "mds_correlation.pdf", 10, 4.5)
+```
+
+## Save outputs
+
+```{r save}
+saveRDS(se.filt, file.path(files_dir, "se.rds"))
+saveRDS(dge.filt, file.path(files_dir, "dge.rds"))
+write.csv(qc_metrics, file.path(files_dir, "qc_metrics.csv"), row.names = FALSE)
+
+writeLines(capture.output(sessionInfo()), here("0_QC", "sessionInfo.txt"))
+```

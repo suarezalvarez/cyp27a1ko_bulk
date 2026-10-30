@@ -1,0 +1,12 @@
+project:
+  name: "cyp27a1_bulk"
+
+genotype_colors:
+  WT: "#998EC3"
+  KO: "#F1A340"
+
+sex_colors:
+  female: "#d4b8f9"
+  male:   "#8f62ca"
+
+divergent_palette: "PuOr"
